@@ -6,23 +6,6 @@ This project implements the collective-foraging model described by Liu, Winfield
 
 Python 3.10 or newer is recommended.
 
-Create a virtual environment in the project folder:
-
-```bash
-python -m venv .venv
-```
-
-Activate it on macOS or Linux:
-
-```bash
-source .venv/bin/activate
-```
-
-Activate it on Windows PowerShell:
-
-```powershell
-.venv\Scripts\Activate.ps1
-```
 
 Install the dependencies:
 
