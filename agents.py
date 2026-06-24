@@ -30,18 +30,18 @@ class Agent:
     target_x: float | None = None
     target_y: float | None = None
     
-    # --- Req 6: Prospect Theory Attributes ---
+    # Req 6: Prospect Theory Attributes 
     energy: float = 2000.0       # Starting internal energy 
     trip_delta: float = 0.0      # Net energy change on the current trip
     
-    # --- Req 5 & 8: Bounded Memory & Strategic Interaction ---
+    # Req 5 & 8: Bounded Memory & Strategic Interaction 
     trip_collisions: int = 0
     trip_food_encounters: int = 0
     trip_active_steps: int = 0
     memory_gamma_r: list[float] = field(default_factory=list) # Memory of collision rates
     memory_gamma_f: list[float] = field(default_factory=list) # Memory of food find rates
     
-    # --- Req 7: Roth-Erev Learning ---
+    #  Req 7: Roth-Erev Learning
     strategies: list[int] = field(default_factory=list)       # Array of possible base resting times (in steps)
     propensities: list[float] = field(default_factory=list)   # Probability weights for each strategy
     current_strategy_idx: int = 0                             # The index of the currently active strategy
@@ -50,13 +50,20 @@ class Agent:
 class MicroModel:
     """Track each robot's state, timers, energy contribution, and display position."""
 
-    def __init__(self, cfg: Config, rest_time_s: float | None = None, seed: int | None = None):
+    def __init__(self, cfg: Config, rest_time_s: float | None = None, seed: int | None = None, **kwargs):
         self.cfg = cfg
         self.world = PaperMap.from_config(cfg)
         seed_value = seed if seed is not None else int(cfg.get("run", "random_seed", default=1))
         self.rng = random.Random(seed_value)
         self.food_rng = random.Random(seed_value + 1)
         self.rest_time_s = float(rest_time_s if rest_time_s is not None else cfg.get("behaviour", "default_rest_time_s"))
+        
+        # --- Req 11: Dynamic Cognitive Parameters for Sobol Sensitivity Analysis ---
+        self.alpha = kwargs.get("alpha", 0.88)
+        self.lambda_loss = kwargs.get("lambda_loss", 2.25)
+        self.recency = kwargs.get("recency", 0.05)
+        self.congestion_tolerance = kwargs.get("congestion_tolerance", 0.04)
+        
         self.ts = self.world.steps(float(cfg.get("behaviour", "search_time_s")))
         self.ta = self.world.steps(float(cfg.get("behaviour", "avoidance_time_s")))
         self.tg = self.world.steps(self.world.tau_grab)
@@ -75,7 +82,7 @@ class MicroModel:
         r = self.rng.uniform(self.world.rinner, self.world.router)
         theta = self.rng.uniform(0.0, 2.0 * math.pi)
         
-        # --- Initialize Roth-Erev Strategies ---
+        # Initialize Roth-Erev Strategies
         # Provide a spectrum of resting behaviors from hyper-aggressive (20s) to hyper-conservative (160s)
         strategy_seconds = [20, 60, 100, 160]
         strategies_steps = [self.world.steps(s) for s in strategy_seconds]
@@ -335,8 +342,8 @@ class MicroModel:
                 collision_cost = avg_gamma_r * self.ts * self.ta * (self.active_cost * self.world.dt)
                 expected_cost = base_cost + collision_cost
                 
-                # 3. Strategic Snoozing Decision
-                if expected_reward < expected_cost:
+                # 3. Strategic Snoozing Decision based on dynamic tolerance
+                if avg_gamma_r > self.congestion_tolerance and expected_reward < expected_cost:
                     # 75% chance to act on the prediction (adds noise to prevent deadlock)
                     if self.rng.random() < 0.75: 
                         snooze = True
@@ -368,7 +375,7 @@ class MicroModel:
         self._clear_food_target(agent)
         agent.state = "resting"
         
-        # RECORD MEMORY FOR BOUNDED RATIONALITY (Req 5) 
+        # RECORD MEMORY FOR BOUNDED RATIONALITY (Req 5)
         if agent.trip_active_steps > 0:
             subj_gamma_r = agent.trip_collisions / agent.trip_active_steps
             subj_gamma_f = agent.trip_food_encounters / agent.trip_active_steps
@@ -386,27 +393,24 @@ class MicroModel:
         
         # PROSPECT THEORY EVALUATION (Req 6)
         x = agent.trip_delta
-        alpha = 0.88       
-        lambda_loss = 2.25 
         
         if x >= 0:
-            subjective_utility = x ** alpha
+            subjective_utility = x ** self.alpha
         else:
-            subjective_utility = -lambda_loss * ((-x) ** alpha)
+            subjective_utility = -self.lambda_loss * ((-x) ** self.alpha)
             
         energy_factor = (agent.energy - self.food_reward) / max(self.food_reward, 1.0)
-        max_expected_utility = self.food_reward ** alpha
+        max_expected_utility = self.food_reward ** self.alpha
         utility_factor = subjective_utility / max(max_expected_utility, 1.0) 
 
-        #ROTH-EREV LEARNING (Req 7)
+        #  ROTH-EREV LEARNING (Req 7) 
         # 1. Calculate Reward Signal (Blend immediate utility with global energy state)
         learning_reward = (utility_factor * 5.0) + (energy_factor * 2.0)
         
         # 2. Update the propensity of the strategy just used
-        recency = 0.05 # Forgetting parameter prevents lock-in
         idx = agent.current_strategy_idx
         
-        new_propensity = (1.0 - recency) * agent.propensities[idx] + learning_reward
+        new_propensity = (1.0 - self.recency) * agent.propensities[idx] + learning_reward
         agent.propensities[idx] = max(0.1, new_propensity) # Floor at 0.1 to maintain exploration
         
         # 3. Select Next Strategy Proportional to Propensities (Roulette Wheel)
