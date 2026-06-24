@@ -7,7 +7,7 @@ energy, transition rates, and optional positions for the animation.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import math
 import random
 
@@ -29,6 +29,15 @@ class Agent:
     heading: float = 0.0
     target_x: float | None = None
     target_y: float | None = None
+    sector_scores: list[float] = field(default_factory=lambda: [0.0, 0.0, 0.0, 0.0])
+
+def get_sector(x: float, y: float) -> int:
+    """Return the sector index (0-3) for a given (x, y) position. Necessary for point 7 in the assignment."""
+    angle = math.atan2(y, x)
+    if angle < 0:
+        angle += 2 * math.pi
+    sector_idx = int(angle // (math.pi / 2))
+    return min(3, max(0, sector_idx))
 
 
 class MicroModel:
@@ -148,6 +157,12 @@ class MicroModel:
         else:
             agent.search_credit -= 1
             agent.timer = agent.search_credit
+
+            #STEP 7: Update sector scores based on the agent's current position.
+            current_sector = get_sector(agent.x, agent.y)
+            # Lower the score for the current sector slightly to encourage exploration
+            agent.sector_scores[current_sector] = max(0.0, agent.sector_scores[current_sector] - 0.005)
+
             if agent.search_credit <= 0:
                 self._go_homing(agent)
         return 0
@@ -171,6 +186,8 @@ class MicroModel:
             self._go_homing(agent)
         elif agent.timer <= 0:
             self._consume_food_target(agent)
+            current_sector = get_sector(agent.x, agent.y) #STEP 7: Get the sector index for the agent's current position
+            agent.sector_scores[current_sector] += 1.0 #STEP 7 and 10: Increment the score for the current sector and some emergent behavoir where agents 'flock' towards their prefered location for finding food.
             agent.state = "deposit"
             agent.timer = self.td
             return 1
@@ -224,6 +241,8 @@ class MicroModel:
                 return 0
             if return_timer <= 0:
                 self._consume_food_target(agent)
+                current_sector = get_sector(agent.x, agent.y) #STEP 7: Get the sector index for the agent's current position
+                agent.sector_scores[current_sector] += 1.0 #STEP 7: Increment the score for the current sector
                 agent.state = "deposit"
                 agent.timer = self.td
                 return 1
@@ -304,9 +323,21 @@ class MicroModel:
             return
 
         agent.heading += random_turn
+
+        if agent.state == "searching": # STEP 7: Update heading based on sector scores
+            max_score = max(agent.sector_scores)
+            if max_score > 0.0:
+                # Find the index of the sector with the highest score
+                best_sector = agent.sector_scores.index(max_score)
+                # calculate the target angle for that sector (0, 1, 2, 3 corresponds to 0, π/2, π, 3π/2)
+                target_angle = best_sector * (math.pi / 2) + (math.pi / 4)
+                # A subtle pull of 8% towards the target angle, while keeping 92% of the current heading
+                agent.heading = 0.92 * agent.heading + 0.08 * target_angle
+
         if agent.state in {"deposit", "homing"} or agent.return_state in {"deposit", "homing"}:
             target = math.atan2(-agent.y, -agent.x)
             agent.heading = 0.85 * agent.heading + 0.15 * target
+
         agent.x += step * math.cos(agent.heading)
         agent.y += step * math.sin(agent.heading)
         radius = math.hypot(agent.x, agent.y)
