@@ -1,4 +1,4 @@
-"""Model individual robots with a stochastic PFSM, Prospect Theory, and El Farol Strategy.
+"""Model individual robots with a stochastic PFSM, Prospect Theory, Bounded Memory, and Roth-Erev Learning.
 
 Inputs are a Config object, an optional mean rest time, random seed, duration,
 and sampling stride. A run returns a pandas DataFrame with state counts, food,
@@ -40,6 +40,11 @@ class Agent:
     trip_active_steps: int = 0
     memory_gamma_r: list[float] = field(default_factory=list) # Memory of collision rates
     memory_gamma_f: list[float] = field(default_factory=list) # Memory of food find rates
+    
+    # --- Req 7: Roth-Erev Learning ---
+    strategies: list[int] = field(default_factory=list)       # Array of possible base resting times (in steps)
+    propensities: list[float] = field(default_factory=list)   # Probability weights for each strategy
+    current_strategy_idx: int = 0                             # The index of the currently active strategy
 
 
 class MicroModel:
@@ -54,7 +59,6 @@ class MicroModel:
         self.rest_time_s = float(rest_time_s if rest_time_s is not None else cfg.get("behaviour", "default_rest_time_s"))
         self.ts = self.world.steps(float(cfg.get("behaviour", "search_time_s")))
         self.ta = self.world.steps(float(cfg.get("behaviour", "avoidance_time_s")))
-        self.tr = self.world.steps(self.rest_time_s)
         self.tg = self.world.steps(self.world.tau_grab)
         self.td = self.world.steps(self.world.tau_deposit)
         self.th = self.world.steps(self.world.tau_home)
@@ -70,6 +74,16 @@ class MicroModel:
     def _new_agent(self) -> Agent:
         r = self.rng.uniform(self.world.rinner, self.world.router)
         theta = self.rng.uniform(0.0, 2.0 * math.pi)
+        
+        # --- Initialize Roth-Erev Strategies ---
+        # Provide a spectrum of resting behaviors from hyper-aggressive (20s) to hyper-conservative (160s)
+        strategy_seconds = [20, 60, 100, 160]
+        strategies_steps = [self.world.steps(s) for s in strategy_seconds]
+        num_strategies = len(strategies_steps)
+        
+        # Start with equal propensities (weight = 10.0) and pick a random initial strategy
+        start_idx = self.rng.randint(0, num_strategies - 1)
+        
         return Agent(
             state="searching",
             timer=self.ts,
@@ -79,13 +93,16 @@ class MicroModel:
             x=r * math.cos(theta),
             y=r * math.sin(theta),
             heading=theta,
-            energy=self.food_reward,  # Initialize with a baseline survival energy
+            energy=self.food_reward,  
             trip_delta=0.0,
             trip_collisions=0,
             trip_food_encounters=0,
             trip_active_steps=0,
             memory_gamma_r=[],
-            memory_gamma_f=[]
+            memory_gamma_f=[],
+            strategies=strategies_steps,
+            propensities=[10.0] * num_strategies,
+            current_strategy_idx=start_idx
         )
 
     def run(self, seconds: float | None = None, stride: int = 1, keep_frames: bool = False) -> pd.DataFrame:
@@ -302,7 +319,7 @@ class MicroModel:
     def _step_resting(self, agent: Agent) -> None:
         agent.timer -= 1
         if agent.timer <= 0:
-        
+            # BOUNDED RATIONALITY & EL FAROL MINORITY GAME (Req 5 & 8) 
             snooze = False
             
             if len(agent.memory_gamma_r) > 0:
@@ -311,25 +328,22 @@ class MicroModel:
                 avg_gamma_f = sum(agent.memory_gamma_f) / len(agent.memory_gamma_f)
                 
                 # 2. Calculate Subjective Expected Value of a standard search trip
-                # Expected reward = Probability of finding food * Reward
                 prob_find_in_trip = 1.0 - (1.0 - avg_gamma_f) ** self.ts
                 expected_reward = prob_find_in_trip * self.food_reward
                 
-                # Expected cost = standard active cost + estimated penalty from collisions
                 base_cost = self.ts * (self.active_cost * self.world.dt)
                 collision_cost = avg_gamma_r * self.ts * self.ta * (self.active_cost * self.world.dt)
                 expected_cost = base_cost + collision_cost
                 
                 # 3. Strategic Snoozing Decision
-                # If they predict the trip will cost more energy than they gain (congested / sparse food)
                 if expected_reward < expected_cost:
                     # 75% chance to act on the prediction (adds noise to prevent deadlock)
                     if self.rng.random() < 0.75: 
                         snooze = True
             
             if snooze:
-                # Hit the snooze button: sleep for half a regular cycle to wait out the crowd
-                agent.timer = max(1, int(self.tr * 0.5))
+                # Hit the snooze button: sleep for half of their currently selected base strategy
+                agent.timer = max(1, int(agent.strategies[agent.current_strategy_idx] * 0.5))
             else:
                 # Wake up and forage
                 agent.state = "searching"
@@ -354,7 +368,7 @@ class MicroModel:
         self._clear_food_target(agent)
         agent.state = "resting"
         
-        
+        # RECORD MEMORY FOR BOUNDED RATIONALITY (Req 5) 
         if agent.trip_active_steps > 0:
             subj_gamma_r = agent.trip_collisions / agent.trip_active_steps
             subj_gamma_f = agent.trip_food_encounters / agent.trip_active_steps
@@ -362,44 +376,55 @@ class MicroModel:
             agent.memory_gamma_r.append(subj_gamma_r)
             agent.memory_gamma_f.append(subj_gamma_f)
             
-            # Keep only a moving window of the last 5 trips (Finite Memory)
             if len(agent.memory_gamma_r) > 5:  
                 agent.memory_gamma_r.pop(0)
                 agent.memory_gamma_f.pop(0)
                 
-        # Reset counters for the next trip
         agent.trip_collisions = 0
         agent.trip_food_encounters = 0
         agent.trip_active_steps = 0
         
-        
-        # 1. Evaluate the trip (x = net energy change)
+        # PROSPECT THEORY EVALUATION (Req 6)
         x = agent.trip_delta
-        alpha = 0.88       # Diminishing sensitivity (standard Prospect Theory parameter)
-        lambda_loss = 2.25 # Loss Aversion multiplier (losses hurt 2.25x more than gains)
+        alpha = 0.88       
+        lambda_loss = 2.25 
         
         if x >= 0:
             subjective_utility = x ** alpha
         else:
             subjective_utility = -lambda_loss * ((-x) ** alpha)
             
-        # 2. Risk Attitude based on overall energy
         energy_factor = (agent.energy - self.food_reward) / max(self.food_reward, 1.0)
-        
-        # Normalize the utility against a perfect trip to keep multipliers stable
         max_expected_utility = self.food_reward ** alpha
         utility_factor = subjective_utility / max(max_expected_utility, 1.0) 
 
-        # Calculate dynamic rest multiplier
-        modifier = 1.0 + (energy_factor * 0.5) + (utility_factor * 0.3)
+        #ROTH-EREV LEARNING (Req 7)
+        # 1. Calculate Reward Signal (Blend immediate utility with global energy state)
+        learning_reward = (utility_factor * 5.0) + (energy_factor * 2.0)
         
-        # Clamp the modifier to prevent extreme edge cases 
-        modifier = max(0.1, min(modifier, 3.0)) 
+        # 2. Update the propensity of the strategy just used
+        recency = 0.05 # Forgetting parameter prevents lock-in
+        idx = agent.current_strategy_idx
         
-        # Assign the dynamically calculated resting time
-        agent.timer = int(max(0, self.tr) * modifier)
+        new_propensity = (1.0 - recency) * agent.propensities[idx] + learning_reward
+        agent.propensities[idx] = max(0.1, new_propensity) # Floor at 0.1 to maintain exploration
         
-        # 3. Reset parameters for the next trip
+        # 3. Select Next Strategy Proportional to Propensities (Roulette Wheel)
+        total_propensity = sum(agent.propensities)
+        probabilities = [p / total_propensity for p in agent.propensities]
+        
+        rand_val = self.rng.random()
+        cumulative = 0.0
+        for i, prob in enumerate(probabilities):
+            cumulative += prob
+            if rand_val <= cumulative:
+                agent.current_strategy_idx = i
+                break
+                
+        # Assign the dynamically chosen, learned rest time
+        agent.timer = agent.strategies[agent.current_strategy_idx]
+        
+        # Reset variables for the next trip
         agent.search_credit = 0
         agent.return_state = ""
         agent.return_timer = 0
