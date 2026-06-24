@@ -1,123 +1,199 @@
-"""Dynamic Time-Series Sobol Sensitivity Analysis for Swarm Foraging.
+"""Run a small dynamic sensitivity analysis for the micro model.
 
-This script uses Variance-Based Global Sensitivity Analysis (Sobol' Indices)
-to determine how cognitive biases drive the swarm's macro-level energy efficiency
-over time.
+Inputs:
+    A Config object or config path, an output folder, sample count, simulated
+    duration, and a random seed.
+
+Outputs:
+    A CSV table of parameter importance over time and one PNG plot. If SALib is
+    installed, the values are Sobol total-order indices. Otherwise the module
+    writes a lightweight correlation-based screening result and labels it as
+    such.
 """
 
+from __future__ import annotations
+
+from pathlib import Path
+import warnings
+
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-from SALib.sample import saltelli
-from SALib.analyze import sobol
 
-from config import Config
 from agents import MicroModel
+from config import Config
 
-def run_dynamic_sobol(config_path: str = "default_config.yaml"):
-    cfg = Config.load(config_path)
-    
-    # 1. Define the Parameter Space for Cognitive Biases
-    problem = {
-        'num_vars': 4,
-        'names': ['alpha', 'lambda_loss', 'recency', 'congestion_tolerance'],
-        'bounds': [
-            [0.5, 1.0],   # alpha: Diminishing sensitivity
-            [1.0, 5.0],   # lambda_loss: Loss aversion multiplier
-            [0.01, 0.20], # recency: Roth-Erev learning forgetting rate
-            [0.01, 0.10]  # congestion_tolerance: El Farol snooze threshold
-        ]
+
+PARAMETER_BOUNDS = {
+    "alpha": (0.5, 1.0),
+    "lambda_loss": (1.0, 5.0),
+    "recency": (0.01, 0.20),
+    "congestion_tolerance": (0.01, 0.10),
+}
+
+
+def run_sensitivity_analysis(
+    cfg: Config,
+    out_dir: str | Path,
+    samples: int = 12,
+    seconds: float = 3000.0,
+    sample_every: float = 100.0,
+    seed: int | None = None,
+) -> list[Path]:
+    """Run sensitivity simulations and write the CSV plus plot.
+
+    Inputs are the model configuration, output folder, sample count, simulated
+    seconds, sampling interval, and optional seed. Outputs are returned as file
+    paths.
+    """
+    out = Path(out_dir)
+    out.mkdir(parents=True, exist_ok=True)
+    seed_value = int(seed if seed is not None else cfg.get("run", "random_seed", default=7))
+    problem = salib_problem()
+    parameter_values, method = make_parameter_samples(problem, samples, seed_value)
+    milestones = time_milestones(seconds)
+    energy = run_parameter_sweep(cfg, parameter_values, seconds, sample_every, milestones, seed_value)
+    data = analyze_parameter_importance(problem, parameter_values, energy, milestones, method)
+
+    csv_path = out / "sensitivity_dynamic.csv"
+    data.to_csv(csv_path, index=False)
+    png_path = out / "fig_dynamic_sensitivity.png"
+    plot_sensitivity(data, png_path)
+    return [png_path, csv_path]
+
+
+def salib_problem() -> dict[str, object]:
+    """Return the parameter space shared by the Sobol and fallback analyses."""
+    return {
+        "num_vars": len(PARAMETER_BOUNDS),
+        "names": list(PARAMETER_BOUNDS.keys()),
+        "bounds": [list(bounds) for bounds in PARAMETER_BOUNDS.values()],
     }
-    
-    # 2. Generate Saltelli Samples
-    # N=64 generates N * (2D + 2) runs. For D=4, this is 64 * 10 = 640 simulations.
-    # Note: For publication-grade results, N should be > 256. 64 is good for testing.
-    param_values = saltelli.sample(problem, 64)
-    num_runs = len(param_values)
-    print(f"Executing {num_runs} ABM runs for Global Sensitivity Analysis...")
-
-    # We will sample the swarm's energy at 4 specific time milestones
-    time_milestones_s = [5000, 10000, 15000, 20000]
-    
-    # Pre-allocate output matrix: rows = simulation runs, cols = time milestones
-    Y = np.zeros([num_runs, len(time_milestones_s)])
-
-    # 3. Execute the ABM for every parameter combination
-    for i, params in enumerate(param_values):
-        if i % 50 == 0:
-            print(f"Running simulation {i}/{num_runs}...")
-            
-        model = MicroModel(
-            cfg=cfg,
-            alpha=params[0],
-            lambda_loss=params[1],
-            recency=params[2],
-            congestion_tolerance=params[3],
-            seed=42 # Lock seed to isolate variance strictly to parameters
-        )
-        
-        # Run model headless (stride=400 captures data roughly every 100 seconds)
-        trace = model.run(stride=400)
-        
-        # Extract energy at the requested time milestones
-        for t_idx, target_time in enumerate(time_milestones_s):
-            # Find the closest time step in the trace
-            closest_row = trace.iloc[(trace['time_s'] - target_time).abs().argsort()[:1]]
-            Y[i, t_idx] = closest_row['energy'].values[0]
-
-    # 4. Analyze Sobol Indices Dynamically Over Time
-    total_order_indices = {name: [] for name in problem['names']}
-    
-    print("Analyzing variance and computing Sobol indices...")
-    for t_idx, time_point in enumerate(time_milestones_s):
-        # Run SALib Sobol analyzer on the energy outputs for this specific time slice
-        Si = sobol.analyze(problem, Y[:, t_idx], print_to_console=False)
-        
-        for p_idx, name in enumerate(problem['names']):
-            # Append the Total-Order index (ST)
-            total_order_indices[name].append(Si['ST'][p_idx])
-
-    # 5. Plot the Dynamic Evolution of Parameter Importance
-    _plot_dynamic_sobol(time_milestones_s, total_order_indices, problem['names'])
 
 
-def _plot_dynamic_sobol(times, st_data, param_names):
-    plt.rcParams.update({
-        "font.family": "serif",
-        "font.size": 10,
-        "axes.titlesize": 12,
-        "xtick.direction": "in",
-        "ytick.direction": "in"
-    })
-    
-    fig, ax = plt.subplots(figsize=(8, 5))
-    
-    colors = ['tab:blue', 'tab:orange', 'tab:green', 'tab:red']
-    labels = [
-        r'$\alpha$ (Utility Linearity)', 
-        r'$\lambda$ (Loss Aversion)', 
-        r'Learning Rate (Recency)', 
-        r'Congestion Tolerance'
-    ]
+def make_parameter_samples(problem: dict[str, object], samples: int, seed: int) -> tuple[np.ndarray, str]:
+    """Create parameter samples for the sensitivity run.
 
-    for name, color, label in zip(param_names, colors, labels):
-        ax.plot(times, st_data[name], marker='o', linewidth=2.5, color=color, label=label)
+    SALib is used when available. The fallback uses random uniform samples and
+    is reported as screening, not Sobol analysis.
+    """
+    samples = max(2, int(samples))
+    try:
+        from SALib.sample import saltelli
 
-    ax.set_title("Evolution of Parameter Importance (Total-Order Sobol Indices)")
-    ax.set_xlabel("Simulation Time (seconds)")
-    ax.set_ylabel(r"Total-Order Sobol Index ($S_T$)")
-    ax.set_xticks(times)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            values = saltelli.sample(problem, samples, calc_second_order=False)
+        return np.asarray(values, dtype=float), "sobol_total_order"
+    except Exception:
+        rng = np.random.default_rng(seed)
+        bounds = np.asarray(problem["bounds"], dtype=float)
+        unit = rng.random((samples, len(problem["names"])))
+        values = bounds[:, 0] + unit * (bounds[:, 1] - bounds[:, 0])
+        return values, "screening_correlation"
+
+
+def time_milestones(seconds: float) -> list[float]:
+    """Choose four evenly spaced times for comparing sensitivity over the run."""
+    seconds = float(seconds)
+    return [0.25 * seconds, 0.50 * seconds, 0.75 * seconds, seconds]
+
+
+def run_parameter_sweep(
+    cfg: Config,
+    parameter_values: np.ndarray,
+    seconds: float,
+    sample_every: float,
+    milestones: list[float],
+    seed: int,
+) -> np.ndarray:
+    """Run the micro model for every sampled parameter set and collect energy."""
+    stride = max(1, int(round(float(sample_every) / cfg.dt)))
+    outputs = np.zeros((len(parameter_values), len(milestones)), dtype=float)
+    names = list(PARAMETER_BOUNDS.keys())
+
+    for index, values in enumerate(parameter_values):
+        params = dict(zip(names, values))
+        model = MicroModel(cfg=cfg, seed=seed, **params)
+        trace = model.run(seconds=seconds, stride=stride)
+        for t_index, target_time in enumerate(milestones):
+            closest = (trace["time_s"] - target_time).abs().idxmin()
+            outputs[index, t_index] = float(trace.loc[closest, "energy"])
+    return outputs
+
+
+def analyze_parameter_importance(
+    problem: dict[str, object],
+    parameter_values: np.ndarray,
+    energy: np.ndarray,
+    milestones: list[float],
+    method: str,
+) -> pd.DataFrame:
+    """Compute importance values for each parameter at each sampled time."""
+    names = list(problem["names"])
+    rows: list[dict[str, float | str]] = []
+
+    if method == "sobol_total_order":
+        from SALib.analyze import sobol
+
+        for t_index, time_s in enumerate(milestones):
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                result = sobol.analyze(problem, energy[:, t_index], calc_second_order=False, print_to_console=False)
+            for name, value in zip(names, result["ST"]):
+                rows.append({"time_s": time_s, "parameter": name, "importance": float(value), "method": method})
+        return pd.DataFrame(rows)
+
+    for t_index, time_s in enumerate(milestones):
+        y = energy[:, t_index]
+        raw_scores = []
+        for p_index in range(parameter_values.shape[1]):
+            x = parameter_values[:, p_index]
+            if np.std(x) < 1e-12 or np.std(y) < 1e-12:
+                raw_scores.append(0.0)
+            else:
+                raw_scores.append(abs(float(np.corrcoef(x, y)[0, 1])))
+        total = sum(raw_scores)
+        scores = [score / total if total > 1e-12 else 0.0 for score in raw_scores]
+        for name, value in zip(names, scores):
+            rows.append({"time_s": time_s, "parameter": name, "importance": float(value), "method": method})
+    return pd.DataFrame(rows)
+
+
+def plot_sensitivity(data: pd.DataFrame, path: str | Path) -> Path:
+    """Draw the sensitivity values over time and save the figure."""
+    path = Path(path)
+    plt.rcParams.update(
+        {
+            "font.family": "serif",
+            "font.size": 9,
+            "axes.titlesize": 10,
+            "axes.labelsize": 9,
+            "legend.fontsize": 8,
+            "xtick.direction": "in",
+            "ytick.direction": "in",
+        }
+    )
+    fig, ax = plt.subplots(figsize=(7.0, 4.4))
+    labels = {
+        "alpha": r"$\alpha$ utility curvature",
+        "lambda_loss": r"$\lambda$ loss aversion",
+        "recency": "Learning recency",
+        "congestion_tolerance": "Congestion tolerance",
+    }
+    colors = ["tab:blue", "tab:orange", "tab:green", "tab:red"]
+    for color, (parameter, group) in zip(colors, data.groupby("parameter", sort=False)):
+        ax.plot(group["time_s"], group["importance"], marker="o", linewidth=1.8, color=color, label=labels.get(parameter, parameter))
+
+    method = str(data["method"].iloc[0]) if not data.empty else "sensitivity"
+    title = "Dynamic Sobol sensitivity" if method == "sobol_total_order" else "Dynamic sensitivity screening"
+    ax.set_title(title)
+    ax.set_xlabel("Simulation time (s)")
+    ax.set_ylabel("Parameter importance")
     ax.set_ylim(0, 1.05)
-    ax.grid(True, linestyle='--', alpha=0.6)
-    
-    ax.legend(loc='upper center', bbox_to_anchor=(0.5, -0.15), ncol=2, frameon=True, edgecolor='black')
-    
+    ax.grid(True, linestyle="--", alpha=0.35)
+    ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.16), ncol=2, frameon=True, edgecolor="black")
     fig.tight_layout()
-    out_path = "fig_dynamic_sobol.png"
-    fig.savefig(out_path, dpi=200, bbox_inches='tight')
+    fig.savefig(path, dpi=180, bbox_inches="tight")
     plt.close(fig)
-    print(f"Sensitivity Analysis complete. Plot saved to {out_path}")
-
-
-if __name__ == "__main__":
-    run_dynamic_sobol()
+    return path

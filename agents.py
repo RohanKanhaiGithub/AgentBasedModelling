@@ -1,8 +1,12 @@
-"""Model individual robots with a stochastic PFSM, Prospect Theory, Bounded Memory, and Roth-Erev Learning.
+"""Run the individual-robot swarm model.
 
-Inputs are a Config object, an optional mean rest time, random seed, duration,
-and sampling stride. A run returns a pandas DataFrame with state counts, food,
-energy, transition rates, and optional positions for the animation.
+Inputs:
+    A Config object, optional rest time, optional random seed, optional cognitive
+    parameters, run duration, and sampling stride.
+
+Outputs:
+    A pandas DataFrame with state counts, food level, energy, transition rates,
+    and optional positions for animation.
 """
 
 from __future__ import annotations
@@ -19,6 +23,8 @@ from map import PaperMap
 
 @dataclass
 class Agent:
+    """Hold one robot's PFSM state, position, memory, and learning weights."""
+
     state: str = "searching"
     timer: int = 0
     search_credit: int = 0
@@ -30,27 +36,25 @@ class Agent:
     target_x: float | None = None
     target_y: float | None = None
     
-    # Req 6: Prospect Theory Attributes 
-    energy: float = 2000.0       # Starting internal energy 
-    trip_delta: float = 0.0      # Net energy change on the current trip
+    energy: float = 2000.0
+    trip_delta: float = 0.0
     
-    # Req 5 & 8: Bounded Memory & Strategic Interaction 
     trip_collisions: int = 0
     trip_food_encounters: int = 0
     trip_active_steps: int = 0
-    memory_gamma_r: list[float] = field(default_factory=list) # Memory of collision rates
-    memory_gamma_f: list[float] = field(default_factory=list) # Memory of food find rates
+    memory_gamma_r: list[float] = field(default_factory=list)
+    memory_gamma_f: list[float] = field(default_factory=list)
     
-    #  Req 7: Roth-Erev Learning
-    strategies: list[int] = field(default_factory=list)       # Array of possible base resting times (in steps)
-    propensities: list[float] = field(default_factory=list)   # Probability weights for each strategy
-    current_strategy_idx: int = 0                             # The index of the currently active strategy
+    strategies: list[int] = field(default_factory=list)
+    propensities: list[float] = field(default_factory=list)
+    current_strategy_idx: int = 0
 
 
 class MicroModel:
     """Track each robot's state, timers, energy contribution, and display position."""
 
     def __init__(self, cfg: Config, rest_time_s: float | None = None, seed: int | None = None, **kwargs):
+        """Create a micro model from configuration and optional behaviour parameters."""
         self.cfg = cfg
         self.world = PaperMap.from_config(cfg)
         seed_value = seed if seed is not None else int(cfg.get("run", "random_seed", default=1))
@@ -58,11 +62,11 @@ class MicroModel:
         self.food_rng = random.Random(seed_value + 1)
         self.rest_time_s = float(rest_time_s if rest_time_s is not None else cfg.get("behaviour", "default_rest_time_s"))
         
-        # --- Req 11: Dynamic Cognitive Parameters for Sobol Sensitivity Analysis ---
         self.alpha = kwargs.get("alpha", 0.88)
         self.lambda_loss = kwargs.get("lambda_loss", 2.25)
         self.recency = kwargs.get("recency", 0.05)
         self.congestion_tolerance = kwargs.get("congestion_tolerance", 0.04)
+        self.gamma_r_scale = kwargs.get("gamma_r_scale", 1.0)
         
         self.ts = self.world.steps(float(cfg.get("behaviour", "search_time_s")))
         self.ta = self.world.steps(float(cfg.get("behaviour", "avoidance_time_s")))
@@ -79,16 +83,14 @@ class MicroModel:
         self._sync_food_positions()
 
     def _new_agent(self) -> Agent:
+        """Create one robot with a random starting position and strategy weights."""
         r = self.rng.uniform(self.world.rinner, self.world.router)
         theta = self.rng.uniform(0.0, 2.0 * math.pi)
         
-        # Initialize Roth-Erev Strategies
-        # Provide a spectrum of resting behaviors from hyper-aggressive (20s) to hyper-conservative (160s)
         strategy_seconds = [20, 60, 100, 160]
         strategies_steps = [self.world.steps(s) for s in strategy_seconds]
         num_strategies = len(strategies_steps)
         
-        # Start with equal propensities (weight = 10.0) and pick a random initial strategy
         start_idx = self.rng.randint(0, num_strategies - 1)
         
         return Agent(
@@ -113,6 +115,7 @@ class MicroModel:
         )
 
     def run(self, seconds: float | None = None, stride: int = 1, keep_frames: bool = False) -> pd.DataFrame:
+        """Run the model and return sampled state, energy, and optional frame data."""
         steps = self.world.steps(float(seconds if seconds is not None else self.cfg.duration_s))
         rows: list[dict[str, float]] = []
         stride = max(1, int(stride))
@@ -130,13 +133,12 @@ class MicroModel:
         return pd.DataFrame(rows)
 
     def step(self) -> dict[str, float]:
+        """Advance the swarm by one time step and return aggregate counters."""
         counts = self.counts()
         active = self.world.n_robots - counts["resting"]
         
-        # Note: These objective global probabilities are calculated for physical bounds, 
-        # but agents only use their subjective memory for decisions.
         gamma_f = self.world.find_probability(self.food)
-        gamma_r = self.world.collision_probability(active)
+        gamma_r = max(0.0, min(1.0, self.world.collision_probability(active) * self.gamma_r_scale))
         competing = counts["searching"] + counts["grabbing"] + counts["avoidance"]
         gamma_l = self.world.loss_probability(self.food, competing, self.tg)
 
@@ -155,17 +157,15 @@ class MicroModel:
         for agent in self.agents:
             self._update_display_position(agent)
 
-            # --- Costs and Tracking ---
             if agent.state == "resting":
                 cost = self.resting_cost * self.world.dt
             else:
                 cost = self.active_cost * self.world.dt
-                agent.trip_active_steps += 1  # Track active time for bounded memory
+                agent.trip_active_steps += 1
                 
             agent.energy -= cost
             agent.trip_delta -= cost
 
-            # --- State Transitions ---
             if agent.state == "searching":
                 entered_deposit += self._step_searching(agent, gamma_f, gamma_r)
 
@@ -207,6 +207,7 @@ class MicroModel:
         return counts
 
     def _step_searching(self, agent: Agent, gamma_f: float, gamma_r: float) -> int:
+        """Update one searching robot and return newly grabbed food count."""
         if agent.search_credit <= 0:
             self._go_homing(agent)
             return 0
@@ -216,7 +217,7 @@ class MicroModel:
         elif u < gamma_r + gamma_f:
             agent.state = "grabbing"
             agent.timer = self.tg
-            agent.trip_food_encounters += 1 # Track physical food encounter for memory
+            agent.trip_food_encounters += 1
             self._assign_food_target(agent)
         else:
             agent.search_credit -= 1
@@ -226,6 +227,7 @@ class MicroModel:
         return 0
 
     def _step_grabbing(self, agent: Agent, gamma_l: float, gamma_r: float) -> int:
+        """Update one grabbing robot and return food entering deposit."""
         if agent.search_credit <= 0:
             self._go_homing(agent)
             return 0
@@ -250,6 +252,7 @@ class MicroModel:
         return 0
 
     def _step_deposit(self, agent: Agent, gamma_r: float) -> int:
+        """Update one depositing robot and return completed deliveries."""
         if self.rng.random() < gamma_r:
             self._go_avoidance(agent, "deposit", agent.timer)
             return 0
@@ -260,6 +263,7 @@ class MicroModel:
         return 0
 
     def _step_homing(self, agent: Agent, gamma_r: float) -> None:
+        """Update one homing robot."""
         if self.rng.random() < gamma_r:
             self._go_avoidance(agent, "homing", agent.timer)
             return
@@ -268,6 +272,7 @@ class MicroModel:
             self._go_resting(agent)
 
     def _step_avoidance(self, agent: Agent) -> int:
+        """Update one avoiding robot and return any delivery completed during avoidance."""
         agent.timer -= 1
         if agent.return_state in {"searching", "grabbing"}:
             agent.search_credit = max(0, agent.search_credit - 1)
@@ -324,17 +329,15 @@ class MicroModel:
         return 0
 
     def _step_resting(self, agent: Agent) -> None:
+        """Update one resting robot and decide whether it wakes or waits longer."""
         agent.timer -= 1
         if agent.timer <= 0:
-            # BOUNDED RATIONALITY & EL FAROL MINORITY GAME (Req 5 & 8) 
             snooze = False
             
             if len(agent.memory_gamma_r) > 0:
-                # 1. Access skewed, subjective worldview from finite memory
                 avg_gamma_r = sum(agent.memory_gamma_r) / len(agent.memory_gamma_r)
                 avg_gamma_f = sum(agent.memory_gamma_f) / len(agent.memory_gamma_f)
                 
-                # 2. Calculate Subjective Expected Value of a standard search trip
                 prob_find_in_trip = 1.0 - (1.0 - avg_gamma_f) ** self.ts
                 expected_reward = prob_find_in_trip * self.food_reward
                 
@@ -342,29 +345,27 @@ class MicroModel:
                 collision_cost = avg_gamma_r * self.ts * self.ta * (self.active_cost * self.world.dt)
                 expected_cost = base_cost + collision_cost
                 
-                # 3. Strategic Snoozing Decision based on dynamic tolerance
                 if avg_gamma_r > self.congestion_tolerance and expected_reward < expected_cost:
-                    # 75% chance to act on the prediction (adds noise to prevent deadlock)
                     if self.rng.random() < 0.75: 
                         snooze = True
             
             if snooze:
-                # Hit the snooze button: sleep for half of their currently selected base strategy
                 agent.timer = max(1, int(agent.strategies[agent.current_strategy_idx] * 0.5))
             else:
-                # Wake up and forage
                 agent.state = "searching"
                 agent.search_credit = self.ts
                 agent.timer = self.ts
 
     def _go_avoidance(self, agent: Agent, previous: str, previous_timer: int) -> None:
+        """Move a robot into avoidance while remembering the interrupted state."""
         agent.return_state = previous
         agent.return_timer = previous_timer
         agent.state = "avoidance"
         agent.timer = self.ta
-        agent.trip_collisions += 1  # Track for Bounded Memory
+        agent.trip_collisions += 1
 
     def _go_homing(self, agent: Agent) -> None:
+        """Send a robot back toward the nest."""
         self._clear_food_target(agent)
         agent.state = "homing"
         agent.timer = self.th
@@ -372,10 +373,10 @@ class MicroModel:
         agent.return_timer = 0
 
     def _go_resting(self, agent: Agent) -> None:
+        """Move a robot to rest and update its trip memory and strategy weights."""
         self._clear_food_target(agent)
         agent.state = "resting"
         
-        # RECORD MEMORY FOR BOUNDED RATIONALITY (Req 5)
         if agent.trip_active_steps > 0:
             subj_gamma_r = agent.trip_collisions / agent.trip_active_steps
             subj_gamma_f = agent.trip_food_encounters / agent.trip_active_steps
@@ -391,7 +392,6 @@ class MicroModel:
         agent.trip_food_encounters = 0
         agent.trip_active_steps = 0
         
-        # PROSPECT THEORY EVALUATION (Req 6)
         x = agent.trip_delta
         
         if x >= 0:
@@ -403,17 +403,13 @@ class MicroModel:
         max_expected_utility = self.food_reward ** self.alpha
         utility_factor = subjective_utility / max(max_expected_utility, 1.0) 
 
-        #  ROTH-EREV LEARNING (Req 7) 
-        # 1. Calculate Reward Signal (Blend immediate utility with global energy state)
         learning_reward = (utility_factor * 5.0) + (energy_factor * 2.0)
         
-        # 2. Update the propensity of the strategy just used
         idx = agent.current_strategy_idx
         
         new_propensity = (1.0 - self.recency) * agent.propensities[idx] + learning_reward
-        agent.propensities[idx] = max(0.1, new_propensity) # Floor at 0.1 to maintain exploration
+        agent.propensities[idx] = max(0.1, new_propensity)
         
-        # 3. Select Next Strategy Proportional to Propensities (Roulette Wheel)
         total_propensity = sum(agent.propensities)
         probabilities = [p / total_propensity for p in agent.propensities]
         
@@ -425,16 +421,15 @@ class MicroModel:
                 agent.current_strategy_idx = i
                 break
                 
-        # Assign the dynamically chosen, learned rest time
         agent.timer = agent.strategies[agent.current_strategy_idx]
         
-        # Reset variables for the next trip
         agent.search_credit = 0
         agent.return_state = ""
         agent.return_timer = 0
         agent.trip_delta = 0.0
 
     def counts(self) -> dict[str, float]:
+        """Count how many robots are in each PFSM state."""
         names = ["searching", "grabbing", "deposit", "homing", "resting", "avoidance"]
         out = {name: 0.0 for name in names}
         for agent in self.agents:
@@ -469,6 +464,7 @@ class MicroModel:
             agent.y *= scale
 
     def _move_toward_food(self, agent: Agent, step: float) -> None:
+        """Move one display marker directly toward its assigned food target."""
         if agent.target_x is None or agent.target_y is None:
             self._assign_food_target(agent)
         if agent.target_x is None or agent.target_y is None:
@@ -486,6 +482,7 @@ class MicroModel:
         agent.y += travel * math.sin(agent.heading)
 
     def _assign_food_target(self, agent: Agent) -> None:
+        """Assign the nearest displayed food marker to a grabbing robot."""
         self._sync_food_positions()
         if not self.food_positions:
             return
@@ -493,10 +490,12 @@ class MicroModel:
         agent.target_x, agent.target_y = target
 
     def _clear_food_target(self, agent: Agent) -> None:
+        """Clear a robot's displayed food target."""
         agent.target_x = None
         agent.target_y = None
 
     def _consume_food_target(self, agent: Agent) -> None:
+        """Remove a displayed food marker when a robot finishes grabbing it."""
         if agent.target_x is not None and agent.target_y is not None:
             target = (agent.target_x, agent.target_y)
             shared = any(
@@ -508,6 +507,7 @@ class MicroModel:
         self._clear_food_target(agent)
 
     def _sync_food_positions(self) -> None:
+        """Keep displayed food markers consistent with the scalar food count."""
         desired = int(math.ceil(max(0.0, self.food) - 1e-12))
         while len(self.food_positions) < desired:
             radius = math.sqrt(

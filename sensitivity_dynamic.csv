@@ -1,0 +1,17 @@
+time_s,parameter,importance,method
+750.0,alpha,0.10376034678404332,screening_correlation
+750.0,lambda_loss,0.35225765447147195,screening_correlation
+750.0,recency,0.2574119770047892,screening_correlation
+750.0,congestion_tolerance,0.2865700217396955,screening_correlation
+1500.0,alpha,0.21742801644097498,screening_correlation
+1500.0,lambda_loss,0.3967301661275886,screening_correlation
+1500.0,recency,0.1318634742528053,screening_correlation
+1500.0,congestion_tolerance,0.2539783431786311,screening_correlation
+2250.0,alpha,0.32972188694407917,screening_correlation
+2250.0,lambda_loss,0.38176421745585315,screening_correlation
+2250.0,recency,0.08106328203909152,screening_correlation
+2250.0,congestion_tolerance,0.2074506135609762,screening_correlation
+3000.0,alpha,0.18871671907402018,screening_correlation
+3000.0,lambda_loss,0.36151825605031573,screening_correlation
+3000.0,recency,0.17323903692366496,screening_correlation
+3000.0,congestion_tolerance,0.2765259879519992,screening_correlation
