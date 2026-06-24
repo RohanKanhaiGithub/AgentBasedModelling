@@ -1,4 +1,4 @@
-"""Model individual robots with a stochastic PFSM and Prospect Theory biases.
+"""Model individual robots with a stochastic PFSM, Prospect Theory, and El Farol Strategy.
 
 Inputs are a Config object, an optional mean rest time, random seed, duration,
 and sampling stride. A run returns a pandas DataFrame with state counts, food,
@@ -7,7 +7,7 @@ energy, transition rates, and optional positions for the animation.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import math
 import random
 
@@ -29,9 +29,17 @@ class Agent:
     heading: float = 0.0
     target_x: float | None = None
     target_y: float | None = None
-    # --- New Prospect Theory Attributes ---
+    
+    # --- Req 6: Prospect Theory Attributes ---
     energy: float = 2000.0       # Starting internal energy 
     trip_delta: float = 0.0      # Net energy change on the current trip
+    
+    # --- Req 5 & 8: Bounded Memory & Strategic Interaction ---
+    trip_collisions: int = 0
+    trip_food_encounters: int = 0
+    trip_active_steps: int = 0
+    memory_gamma_r: list[float] = field(default_factory=list) # Memory of collision rates
+    memory_gamma_f: list[float] = field(default_factory=list) # Memory of food find rates
 
 
 class MicroModel:
@@ -72,7 +80,12 @@ class MicroModel:
             y=r * math.sin(theta),
             heading=theta,
             energy=self.food_reward,  # Initialize with a baseline survival energy
-            trip_delta=0.0
+            trip_delta=0.0,
+            trip_collisions=0,
+            trip_food_encounters=0,
+            trip_active_steps=0,
+            memory_gamma_r=[],
+            memory_gamma_f=[]
         )
 
     def run(self, seconds: float | None = None, stride: int = 1, keep_frames: bool = False) -> pd.DataFrame:
@@ -95,6 +108,9 @@ class MicroModel:
     def step(self) -> dict[str, float]:
         counts = self.counts()
         active = self.world.n_robots - counts["resting"]
+        
+        # Note: These objective global probabilities are calculated for physical bounds, 
+        # but agents only use their subjective memory for decisions.
         gamma_f = self.world.find_probability(self.food)
         gamma_r = self.world.collision_probability(active)
         competing = counts["searching"] + counts["grabbing"] + counts["avoidance"]
@@ -115,16 +131,17 @@ class MicroModel:
         for agent in self.agents:
             self._update_display_position(agent)
 
-            #  Prospect Theory: Track subjective energy deltas
+            # --- Costs and Tracking ---
             if agent.state == "resting":
                 cost = self.resting_cost * self.world.dt
             else:
                 cost = self.active_cost * self.world.dt
+                agent.trip_active_steps += 1  # Track active time for bounded memory
                 
             agent.energy -= cost
             agent.trip_delta -= cost
 
-            # State Transitions 
+            # --- State Transitions ---
             if agent.state == "searching":
                 entered_deposit += self._step_searching(agent, gamma_f, gamma_r)
 
@@ -175,6 +192,7 @@ class MicroModel:
         elif u < gamma_r + gamma_f:
             agent.state = "grabbing"
             agent.timer = self.tg
+            agent.trip_food_encounters += 1 # Track physical food encounter for memory
             self._assign_food_target(agent)
         else:
             agent.search_credit -= 1
@@ -284,15 +302,46 @@ class MicroModel:
     def _step_resting(self, agent: Agent) -> None:
         agent.timer -= 1
         if agent.timer <= 0:
-            agent.state = "searching"
-            agent.search_credit = self.ts
-            agent.timer = self.ts
+        
+            snooze = False
+            
+            if len(agent.memory_gamma_r) > 0:
+                # 1. Access skewed, subjective worldview from finite memory
+                avg_gamma_r = sum(agent.memory_gamma_r) / len(agent.memory_gamma_r)
+                avg_gamma_f = sum(agent.memory_gamma_f) / len(agent.memory_gamma_f)
+                
+                # 2. Calculate Subjective Expected Value of a standard search trip
+                # Expected reward = Probability of finding food * Reward
+                prob_find_in_trip = 1.0 - (1.0 - avg_gamma_f) ** self.ts
+                expected_reward = prob_find_in_trip * self.food_reward
+                
+                # Expected cost = standard active cost + estimated penalty from collisions
+                base_cost = self.ts * (self.active_cost * self.world.dt)
+                collision_cost = avg_gamma_r * self.ts * self.ta * (self.active_cost * self.world.dt)
+                expected_cost = base_cost + collision_cost
+                
+                # 3. Strategic Snoozing Decision
+                # If they predict the trip will cost more energy than they gain (congested / sparse food)
+                if expected_reward < expected_cost:
+                    # 75% chance to act on the prediction (adds noise to prevent deadlock)
+                    if self.rng.random() < 0.75: 
+                        snooze = True
+            
+            if snooze:
+                # Hit the snooze button: sleep for half a regular cycle to wait out the crowd
+                agent.timer = max(1, int(self.tr * 0.5))
+            else:
+                # Wake up and forage
+                agent.state = "searching"
+                agent.search_credit = self.ts
+                agent.timer = self.ts
 
     def _go_avoidance(self, agent: Agent, previous: str, previous_timer: int) -> None:
         agent.return_state = previous
         agent.return_timer = previous_timer
         agent.state = "avoidance"
         agent.timer = self.ta
+        agent.trip_collisions += 1  # Track for Bounded Memory
 
     def _go_homing(self, agent: Agent) -> None:
         self._clear_food_target(agent)
@@ -305,7 +354,25 @@ class MicroModel:
         self._clear_food_target(agent)
         agent.state = "resting"
         
-        # --- PROSPECT THEORY EVALUATION ---
+        
+        if agent.trip_active_steps > 0:
+            subj_gamma_r = agent.trip_collisions / agent.trip_active_steps
+            subj_gamma_f = agent.trip_food_encounters / agent.trip_active_steps
+            
+            agent.memory_gamma_r.append(subj_gamma_r)
+            agent.memory_gamma_f.append(subj_gamma_f)
+            
+            # Keep only a moving window of the last 5 trips (Finite Memory)
+            if len(agent.memory_gamma_r) > 5:  
+                agent.memory_gamma_r.pop(0)
+                agent.memory_gamma_f.pop(0)
+                
+        # Reset counters for the next trip
+        agent.trip_collisions = 0
+        agent.trip_food_encounters = 0
+        agent.trip_active_steps = 0
+        
+        
         # 1. Evaluate the trip (x = net energy change)
         x = agent.trip_delta
         alpha = 0.88       # Diminishing sensitivity (standard Prospect Theory parameter)
@@ -317,8 +384,6 @@ class MicroModel:
             subjective_utility = -lambda_loss * ((-x) ** alpha)
             
         # 2. Risk Attitude based on overall energy
-        # Baseline energy is assumed to be self.food_reward. 
-        # > Baseline = "full" (risk-averse), < Baseline = "starving" (risk-seeking)
         energy_factor = (agent.energy - self.food_reward) / max(self.food_reward, 1.0)
         
         # Normalize the utility against a perfect trip to keep multipliers stable
@@ -326,10 +391,9 @@ class MicroModel:
         utility_factor = subjective_utility / max(max_expected_utility, 1.0) 
 
         # Calculate dynamic rest multiplier
-        # High energy (+ factor) = rest longer. Highly negative utility (- factor) = rest shorter (desperate)
         modifier = 1.0 + (energy_factor * 0.5) + (utility_factor * 0.3)
         
-        # Clamp the modifier to prevent extreme edge cases (rest between 10% and 300% of baseline)
+        # Clamp the modifier to prevent extreme edge cases 
         modifier = max(0.1, min(modifier, 3.0)) 
         
         # Assign the dynamically calculated resting time
@@ -339,7 +403,7 @@ class MicroModel:
         agent.search_credit = 0
         agent.return_state = ""
         agent.return_timer = 0
-        agent.trip_delta = 0.0 # Reset trip memory
+        agent.trip_delta = 0.0
 
     def counts(self) -> dict[str, float]:
         names = ["searching", "grabbing", "deposit", "homing", "resting", "avoidance"]
