@@ -59,6 +59,8 @@ Create Figures 8–10 and their CSV files:
 python cli.py plots
 ```
 
+The plot command computes values from the macro model and microscopic simulation runs. Figure 8 sweeps the configured rest times, Figure 9 uses real energy traces, and Figure 10 uses direct state-count traces.
+
 Create the macro trace with an 80-second mean rest time:
 
 ```bash

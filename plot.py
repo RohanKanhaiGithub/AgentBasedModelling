@@ -9,6 +9,9 @@ from __future__ import annotations
 from pathlib import Path
 import numpy as np
 import pandas as pd
+import matplotlib
+
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.lines import Line2D
 
@@ -17,12 +20,7 @@ from macro import MacroModel
 from agents import MicroModel
 
 
-# Player/Stage reference points and error bars digitised from Figure 8.
-FIG8_SIM_TAU = np.array([0, 40, 80, 120, 160, 200], dtype=float)
-FIG8_SIM_ENERGY_1E5 = np.array([0.0, 4.4, 7.2, 9.2, 10.2, 9.0], dtype=float)
-FIG8_SIM_ERR_1E5 = np.array([0.6, 0.45, 0.6, 0.6, 0.35, 0.25], dtype=float)
-# Black model curve digitised from Figure 8.
-FIG8_MODEL_ENERGY_1E5 = np.array([0.0, 4.55, 7.30, 9.10, 10.85, 9.05], dtype=float)
+ENERGY_SCALE = 1e5
 
 
 def ensure_dir(path: str | Path) -> Path:
@@ -52,6 +50,47 @@ def _stride_steps(cfg: Config) -> int:
     return max(1, int(round(stride_s / cfg.dt)))
 
 
+def _micro_frames(cfg: Config, rest_time_s: float, stride: int) -> list[pd.DataFrame]:
+    runs = int(cfg.get("run", "micro_runs", default=10))
+    seed0 = int(cfg.get("run", "random_seed", default=7))
+    return [
+        MicroModel(cfg, rest_time_s=rest_time_s, seed=seed).run(stride=stride)
+        for seed in range(seed0, seed0 + runs)
+    ]
+
+
+def _micro_mean_and_std(frames: list[pd.DataFrame]) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if not frames:
+        raise ValueError("at least one micro simulation run is required")
+
+    min_len = min(len(frame) for frame in frames)
+    mean = frames[0][["time_s", "rest_time_s"]].iloc[:min_len].copy()
+    std = mean.copy()
+    skip = {"time_s", "rest_time_s", "positions", "food_positions"}
+    value_cols = [col for col in frames[0].columns if col not in skip]
+
+    for col in value_cols:
+        values = np.vstack([frame[col].to_numpy()[:min_len] for frame in frames])
+        mean[col] = values.mean(axis=0)
+        std[col] = values.std(axis=0, ddof=1) if len(frames) > 1 else 0.0
+    return mean, std
+
+
+def _energy_1e5(values: pd.Series | np.ndarray | float) -> pd.Series | np.ndarray | float:
+    return values / ENERGY_SCALE
+
+
+def _set_energy_limits(ax, *series: pd.Series | np.ndarray) -> None:
+    values = np.concatenate([np.asarray(s, dtype=float).ravel() for s in series])
+    values = values[np.isfinite(values)]
+    if len(values) == 0:
+        return
+    lower = min(0.0, float(values.min()))
+    upper = max(0.0, float(values.max()))
+    margin = 1.0 if abs(upper - lower) < 1e-12 else 0.08 * (upper - lower)
+    ax.set_ylim(lower - margin, upper + margin)
+
+
 def write_macro_csv(cfg: Config, out_dir: str | Path, rest_time_s: float | None = None) -> Path:
     out = ensure_dir(out_dir)
     model = MacroModel(cfg, rest_time_s=rest_time_s)
@@ -66,24 +105,43 @@ def plot_fig8(cfg: Config, out_dir: str | Path) -> tuple[Path, Path]:
     _paper_style()
     out = ensure_dir(out_dir)
     rest_times = [float(x) for x in cfg.get("behaviour", "rest_times_s")]
+    if not rest_times:
+        raise ValueError("behaviour.rest_times_s must contain at least one rest time")
+    stride = _stride_steps(cfg)
+    rows = []
 
-    data = pd.DataFrame(
-        {
-            "rest_time_s": rest_times,
-            "model_energy_1e5": FIG8_MODEL_ENERGY_1E5,
-            "model_energy": FIG8_MODEL_ENERGY_1E5 * 1e5,
-            "paper_sim_energy_1e5": FIG8_SIM_ENERGY_1E5,
-            "paper_sim_error_1e5": FIG8_SIM_ERR_1E5,
-        }
-    )
+    for tau_r in rest_times:
+        macro = MacroModel(cfg, rest_time_s=tau_r).run(stride=stride).trace
+        micro_frames = _micro_frames(cfg, tau_r, stride)
+        micro_final_energy = np.array([frame["energy"].iloc[-1] for frame in micro_frames], dtype=float)
+        micro_final_std = float(micro_final_energy.std(ddof=1)) if len(micro_final_energy) > 1 else 0.0
+        rows.append(
+            {
+                "rest_time_s": tau_r,
+                "model_energy": float(macro["energy"].iloc[-1]),
+                "model_energy_1e5": float(_energy_1e5(macro["energy"].iloc[-1])),
+                "simulation_energy": float(micro_final_energy.mean()),
+                "simulation_energy_1e5": float(_energy_1e5(micro_final_energy.mean())),
+                "simulation_energy_std": micro_final_std,
+                "simulation_energy_std_1e5": float(_energy_1e5(micro_final_std)),
+                "simulation_runs": len(micro_final_energy),
+            }
+        )
+
+    data = pd.DataFrame(rows)
     csv_path = out / "fig8_macro_summary.csv"
     data.to_csv(csv_path, index=False)
 
+    rest_time_x = data["rest_time_s"].to_numpy(dtype=float)
+    sim_y = data["simulation_energy_1e5"].to_numpy(dtype=float)
+    sim_err = data["simulation_energy_std_1e5"].to_numpy(dtype=float)
+    model_y = data["model_energy_1e5"].to_numpy(dtype=float)
+
     fig, ax = plt.subplots(figsize=(6.1, 4.1))
     sim_handle = ax.errorbar(
-        FIG8_SIM_TAU,
-        FIG8_SIM_ENERGY_1E5,
-        yerr=FIG8_SIM_ERR_1E5,
+        rest_time_x,
+        sim_y,
+        yerr=sim_err,
         fmt="o--",
         color="blue",
         ecolor="black",
@@ -95,19 +153,18 @@ def plot_fig8(cfg: Config, out_dir: str | Path) -> tuple[Path, Path]:
         markeredgewidth=0.8,
         label="simulation",
     )
-    model_handle, = ax.plot(data["rest_time_s"], data["model_energy_1e5"], color="black", linewidth=0.7, label="model")
+    model_handle, = ax.plot(rest_time_x, model_y, color="black", linewidth=0.7, label="model")
 
-    peak_tau = 160
-    peak_sim = float(FIG8_SIM_ENERGY_1E5[list(FIG8_SIM_TAU).index(peak_tau)])
-    peak_model = float(data.loc[data["rest_time_s"] == peak_tau, "model_energy_1e5"].iloc[0])
-    ax.axvline(peak_tau, ymin=(-4.5 + 5) / 19.5, ymax=(peak_sim + 5) / 19.5, color="blue", linestyle="--", linewidth=0.65, dashes=(7, 7))
-    ax.axhline(peak_sim, color="blue", linestyle="--", linewidth=0.65, dashes=(7, 7))
-    ax.axhline(peak_model, color="black", linestyle="--", linewidth=0.65, dashes=(7, 7))
-
-    ax.set_xlim(-20, 220)
-    ax.set_ylim(-5, 14.5)
-    ax.set_xticks([0, 40, 80, 120, 160, 200])
-    ax.set_yticks(np.arange(-4, 15, 2))
+    max_tau = max(rest_times) if rest_times else 0.0
+    pad = 0.05 * max(1.0, max_tau)
+    ax.set_xlim(min(0.0, min(rest_times)) - pad, max_tau + pad)
+    ax.set_xticks(rest_times)
+    _set_energy_limits(
+        ax,
+        sim_y - sim_err,
+        sim_y + sim_err,
+        model_y,
+    )
     ax.set_xlabel(r"$\tau_r$  (seconds)")
     ax.set_ylabel(r"energy of swarm  ($10^5$ units)")
     ax.legend([sim_handle, model_handle], ["simulation", "model"], loc="lower left", bbox_to_anchor=(0.22, 0.08), frameon=True, fancybox=False, edgecolor="black")
@@ -119,34 +176,42 @@ def plot_fig8(cfg: Config, out_dir: str | Path) -> tuple[Path, Path]:
 
 
 def _micro_average(cfg: Config, rest_time_s: float, stride: int) -> pd.DataFrame:
-    runs = int(cfg.get("run", "micro_runs", default=10))
-    seed0 = int(cfg.get("run", "random_seed", default=7))
-    frames = []
-    for seed in range(seed0, seed0 + runs):
-        frames.append(MicroModel(cfg, rest_time_s=rest_time_s, seed=seed).run(stride=stride))
-    base = frames[0][["time_s"]].copy()
-    for col in ["energy", "searching", "resting", "homing"]:
-        min_len = min(len(f[col]) for f in frames)
-        base = base.iloc[:min_len].copy()
-        base[col] = np.vstack([f[col].to_numpy()[:min_len] for f in frames]).mean(axis=0)
-    return base
+    mean, _ = _micro_mean_and_std(_micro_frames(cfg, rest_time_s, stride))
+    return mean
 
 
 
-def _save_fig9(out: Path, tau_r: float, macro: pd.DataFrame, micro: pd.DataFrame) -> Path:
+def _save_fig9(out: Path, tau_r: float, macro: pd.DataFrame, micro: pd.DataFrame, micro_std: pd.DataFrame | None = None) -> Path:
     _paper_style()
     fig, ax = plt.subplots(figsize=(6.1, 4.0))
-    time = macro["time_s"].to_numpy()
-    # Figure 9 uses the published tau_r=80 final-energy scale.
-    final_scale = float(FIG8_MODEL_ENERGY_1E5[2])
-    model_y = final_scale * time / time[-1]
-    sim_y = model_y + 0.08 * np.sin(time / 650.0)
-    sim_handle = ax.errorbar(time, sim_y, yerr=0.35, color="0.65", linewidth=0.45, errorevery=80, capsize=1.5, label="simulation")
-    model_handle, = ax.plot(time, model_y, color="red", linewidth=0.9, label="model")
-    ax.set_xlim(0, 20000)
-    ax.set_ylim(0, 9)
-    ax.set_xticks(np.arange(0, 20001, 4000))
-    ax.set_yticks(np.arange(0, 10, 1))
+    macro_time = macro["time_s"].to_numpy(dtype=float)
+    micro_time = micro["time_s"].to_numpy(dtype=float)
+    macro_y = _energy_1e5(macro["energy"].to_numpy(dtype=float))
+    micro_y = _energy_1e5(micro["energy"].to_numpy(dtype=float))
+    micro_err = (
+        _energy_1e5(micro_std["energy"].to_numpy(dtype=float))
+        if micro_std is not None and "energy" in micro_std
+        else None
+    )
+    errorevery = max(1, len(micro) // 25)
+    sim_handle = ax.errorbar(
+        micro_time,
+        micro_y,
+        yerr=micro_err,
+        color="0.65",
+        linewidth=0.45,
+        errorevery=errorevery,
+        capsize=1.5,
+        label="simulation",
+    )
+    model_handle, = ax.plot(macro_time, macro_y, color="red", linewidth=0.9, label="model")
+    max_time = max(float(macro_time[-1]), float(micro_time[-1]))
+    ax.set_xlim(0, max_time)
+    ax.set_xticks(np.linspace(0, max_time, 6))
+    if micro_err is None:
+        _set_energy_limits(ax, macro_y, micro_y)
+    else:
+        _set_energy_limits(ax, macro_y, micro_y - micro_err, micro_y + micro_err)
     ax.set_xlabel("Time (s)")
     ax.set_ylabel(r"energy of swarm  ($10^5$ units)")
     ax.legend([sim_handle, model_handle], ["simulation", "model"], loc="upper left", frameon=True, fancybox=False, edgecolor="black")
@@ -162,37 +227,33 @@ def plot_fig9(cfg: Config, out_dir: str | Path, rest_time_s: float | None = None
     tau_r = float(rest_time_s if rest_time_s is not None else cfg.get("behaviour", "default_rest_time_s"))
     stride = _stride_steps(cfg)
     macro = MacroModel(cfg, rest_time_s=tau_r).run(stride=stride).trace
-    micro = _micro_average(cfg, tau_r, stride)
-    return _save_fig9(out, tau_r, macro, micro)
+    micro, micro_std = _micro_mean_and_std(_micro_frames(cfg, tau_r, stride))
+    return _save_fig9(out, tau_r, macro, micro, micro_std)
 
 
 def _save_fig10(out: Path, tau_r: float, macro: pd.DataFrame, micro: pd.DataFrame) -> Path:
     _paper_style()
     fig, ax = plt.subplots(figsize=(6.1, 4.05))
     colors = {"searching": "tab:red", "resting": "tab:green", "homing": "tab:blue"}
+    macro_time = macro["time_s"].to_numpy(dtype=float)
+    micro_time = micro["time_s"].to_numpy(dtype=float)
     for state, color in colors.items():
-        ax.plot(micro["time_s"], micro[state], color=color, linewidth=0.35, alpha=0.75)
+        ax.plot(micro_time, micro[state].to_numpy(dtype=float), color=color, linewidth=0.35, alpha=0.75)
 
-    def _match_tail(series: pd.Series, target: float) -> np.ndarray:
-        tail = series[macro["time_s"] > 5000]
-        denom = float(tail.median()) if len(tail) else float(series.iloc[-1])
-        if abs(denom) < 1e-12:
-            return np.full(len(series), target)
-        return series.to_numpy() * target / denom
-
-    model_searching = _match_tail(macro["searching"], 2.0)
-    model_resting = _match_tail(macro["resting"], 3.8)
-    model_homing = _match_tail(macro["homing"], 0.15)
     for values, state in [
-        (model_searching, "searching"),
-        (model_resting, "resting"),
-        (model_homing, "homing"),
+        (macro["searching"], "searching"),
+        (macro["resting"], "resting"),
+        (macro["homing"], "homing"),
     ]:
-        ax.plot(macro["time_s"], values, color=colors[state], linestyle="--", linewidth=1.0)
-    ax.set_xlim(0, 20000)
-    ax.set_ylim(0, 8)
-    ax.set_xticks([0, 5000, 10000, 15000, 20000])
-    ax.set_yticks(np.arange(0, 9, 1))
+        ax.plot(macro_time, values.to_numpy(dtype=float), color=colors[state], linestyle="--", linewidth=1.0)
+    max_time = max(float(macro_time[-1]), float(micro_time[-1]))
+    max_count = max(float(micro[state].max()) for state in colors)
+    max_count = max(max_count, *(float(macro[state].max()) for state in colors))
+    upper = max(1, int(np.ceil(max_count)))
+    ax.set_xlim(0, max_time)
+    ax.set_ylim(0, upper)
+    ax.set_xticks(np.linspace(0, max_time, 5))
+    ax.set_yticks(np.arange(0, upper + 1, 1))
     ax.set_xlabel("Time (s)")
     ax.set_ylabel("Robots")
     state_handles = [
@@ -242,8 +303,8 @@ def make_all_plots(cfg: Config, out_dir: str | Path) -> list[Path]:
     tau_r = float(cfg.get("behaviour", "default_rest_time_s"))
     stride = _stride_steps(cfg)
     macro = MacroModel(cfg, rest_time_s=tau_r).run(stride=stride).trace
-    micro = _micro_average(cfg, tau_r, stride)
-    p9 = _save_fig9(out, tau_r, macro, micro)
+    micro, micro_std = _micro_mean_and_std(_micro_frames(cfg, tau_r, stride))
+    p9 = _save_fig9(out, tau_r, macro, micro, micro_std)
     p10 = _save_fig10(out, tau_r, macro, micro)
     macro_csv = out / f"macro_trace_tau_r_{int(tau_r)}.csv"
     macro.to_csv(macro_csv, index=False)
