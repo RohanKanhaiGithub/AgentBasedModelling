@@ -421,4 +421,31 @@ def make_all_plots(cfg: Config, out_dir: str | Path) -> list[Path]:
     p12, c12 = plot_fig12_energy_divergence(cfg, out)
     macro_csv = out / f"macro_trace_tau_r_{int(tau_r)}.csv"
     macro.to_csv(macro_csv, index=False)
-    return [p8, csv, p9, p10, p11, c11, p12, c12, macro_csv]
+    clustering_plot_path = plot_clustering_comparison(cfg)
+    
+    return [p8, csv, p9, p10, p11, c11, p12, c12, macro_csv, clustering_plot_path]
+
+
+def plot_clustering_comparison(cfg):
+    # Run 1: without learning (Stap 7 turned off)
+    model_off = MicroModel(cfg, use_spatial_learning=False)
+    df_off = model_off.run(seconds=4000, stride=4) # kortere duur voor snelle test
+    
+    # Run 2: with learning (Stap 7 turned on)
+    model_on = MicroModel(cfg, use_spatial_learning=True)
+    df_on = model_on.run(seconds=4000, stride=4)
+    
+    # plot the clustering index over time for both runs
+    plt.figure(figsize=(10, 5))
+    plt.plot(df_off["time_s"], df_off["clustering_index"], label="Without Learning (Homogeneous)", color="gray", linestyle="--")
+    plt.plot(df_on["time_s"], df_on["clustering_index"], label="With Learning (Spatial Memory)", color="tab:blue")
+    
+    plt.title("Swarm Clustering Over Time")
+    plt.xlabel("Simulation time (seconds)")
+    plt.ylabel("Clustering Index (Standard deviation of sectors)")
+    plt.legend()
+    plt.grid(True)
+    plt.savefig("clustering_comparison.png")
+    plt.close()
+
+

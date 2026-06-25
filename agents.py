@@ -70,10 +70,11 @@ def get_sector(x: float, y: float) -> int:
 class MicroModel:
     """Track each robot's state, timers, energy contribution, and display position."""
 
-    def __init__(self, cfg: Config, rest_time_s: float | None = None, seed: int | None = None, **kwargs):
+    def __init__(self, cfg: Config, rest_time_s: float | None = None, seed: int | None = None, use_spatial_learning: bool = True, **kwargs):
         """Create a micro model from configuration and optional behaviour parameters."""
         self.cfg = cfg
         self.world = PaperMap.from_config(cfg)
+        self.use_spatial_learning = use_spatial_learning
         seed_value = seed if seed is not None else int(cfg.get("run", "random_seed", default=1))
         self.rng = random.Random(seed_value)
         self.food_rng = random.Random(seed_value + 1)
@@ -149,6 +150,14 @@ class MicroModel:
                 if keep_frames:
                     stats["positions"] = [(a.x, a.y, a.state) for a in self.agents]
                     stats["food_positions"] = list(self.food_positions)
+                sector_counts = [0, 0, 0, 0]
+                for a in self.agents:
+                    if a.state in {"searching", "grabbing", "avoidance"}:
+                        s = get_sector(a.x, a.y)
+                        sector_counts[s] += 1
+                mean_counts = sum(sector_counts) / 4
+                variance = sum((x - mean_counts) ** 2 for x in sector_counts) / 4
+                stats["clustering_index"] = math.sqrt(variance)
                 rows.append(stats)
         return pd.DataFrame(rows)
 
@@ -474,14 +483,17 @@ class MicroModel:
             return
 
         agent.heading += random_turn
-        if agent.state == "searching":
+
+        if agent.state == "searching" and self.use_spatial_learning:
             self._steer_toward_best_sector(agent)
+
         if agent.state in {"deposit", "homing"} or agent.return_state in {"deposit", "homing"}:
             target = math.atan2(-agent.y, -agent.x)
             agent.heading = 0.85 * agent.heading + 0.15 * target
         agent.x += step * math.cos(agent.heading)
         agent.y += step * math.sin(agent.heading)
         radius = math.hypot(agent.x, agent.y)
+
         if radius > self.world.router:
             agent.heading += math.pi
             scale = self.world.router / max(radius, 1e-9)
